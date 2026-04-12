@@ -338,8 +338,90 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
-    return 1;
+    child_config_t *cfg = (child_config_t *)arg;
+
+    /* --- UTS namespace: set this container's hostname --- */
+    if (sethostname(cfg->id, strlen(cfg->id)) < 0)
+        perror("sethostname");   /* non-fatal */
+
+    /* --- Mount namespace: mount fresh /proc ---
+     *
+     * After CLONE_NEWPID the child has its own PID namespace.
+     * /proc is NOT automatically remounted — we must do it
+     * manually so that ps/top inside the container only see
+     * processes inside this namespace, not the host's.
+     *
+     * The mount point rootfs/proc must exist; mkdir is a no-op
+     * if it's already there.
+     */
+    char proc_path[PATH_MAX];
+    snprintf(proc_path, sizeof(proc_path), "%s/proc", cfg->rootfs);
+    mkdir(proc_path, 0555);
+
+    if (mount("proc", proc_path, "proc",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+        perror("mount /proc");   /* non-fatal */
+
+    /* --- Filesystem isolation: chroot into rootfs ---
+     *
+     * After chroot(), "/" for this process and all its children
+     * is cfg->rootfs on the host.  The host filesystem above
+     * that directory becomes completely inaccessible.
+     *
+     * chdir("/") is mandatory after chroot() — without it the
+     * current working directory can still reference the old root
+     * through a dangling ".." path.
+     */
+    if (chroot(cfg->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+    if (chdir("/") < 0) {
+        perror("chdir /");
+        return 1;
+    }
+
+    /* --- Logging: redirect stdout/stderr into supervisor pipe ---
+     *
+     * The supervisor opens a pipe before clone() and passes the
+     * write-end here (Task 3).  dup2 replaces fd 1 and fd 2 with
+     * the pipe so all container output flows to the log buffer.
+     * We close the original fd afterwards to avoid a leak.
+     */
+    if (cfg->log_write_fd >= 0) {
+        dup2(cfg->log_write_fd, STDOUT_FILENO);
+        dup2(cfg->log_write_fd, STDERR_FILENO);
+        close(cfg->log_write_fd);
+    }
+
+    /* --- Execute the container command ---
+     *
+     * Parse cfg->command into argv.  We support a single
+     * space-separated command string for simplicity.
+     * execv() replaces this process image — namespaces and
+     * chroot survive across exec.
+     */
+    char cmd_copy[CHILD_COMMAND_LEN];
+    strncpy(cmd_copy, cfg->command, CHILD_COMMAND_LEN - 1);
+    cmd_copy[CHILD_COMMAND_LEN - 1] = '\0';
+
+    char *argv[16];
+    int argc = 0;
+    char *tok = strtok(cmd_copy, " \t");
+    while (tok && argc < 15) {
+        argv[argc++] = tok;
+        tok = strtok(NULL, " \t");
+    }
+    argv[argc] = NULL;
+
+    if (argc == 0) {
+        fprintf(stderr, "child_fn: empty command\n");
+        return 1;
+    }
+
+    execv(argv[0], argv);
+    perror("execv");   /* only reached if execv fails */
+    return 127;
 }
 
 int register_with_monitor(int monitor_fd,
@@ -387,6 +469,251 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
  *   - accept control requests and update container state
  *   - reap children and respond to signals
  */
+ 
+ /* Global shutdown flag — set by SIGTERM/SIGINT handler */
+static volatile sig_atomic_t g_should_stop = 0;
+
+static void sigchld_handler(int sig)
+{
+    (void)sig;
+    int saved_errno = errno;
+    int status;
+    pid_t pid;
+    /*
+     * Loop because multiple children may have exited between
+     * two deliveries of SIGCHLD — Linux can coalesce signals.
+     * WNOHANG prevents blocking if no child is ready.
+     */
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        /* state update happens in handle_request via metadata_lock */
+        (void)pid; (void)status;
+    }
+    errno = saved_errno;
+}
+
+static void sigterm_handler(int sig)
+{
+    (void)sig;
+    g_should_stop = 1;
+}
+
+/*
+ * handle_request — reads one control_request_t from the client,
+ * dispatches it, and writes back a control_response_t.
+ */
+static void handle_request(supervisor_ctx_t *ctx,
+                            int client_fd,
+                            const char *rootfs)
+{
+    control_request_t req;
+    control_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    ssize_t n = recv(client_fd, &req, sizeof(req), 0);
+    if (n != (ssize_t)sizeof(req)) {
+        resp.status = -1;
+        snprintf(resp.message, sizeof(resp.message), "bad request size");
+        send(client_fd, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    if (req.kind == CMD_START || req.kind == CMD_RUN) {
+        /*
+         * Allocate a new container record and clone() the child.
+         *
+         * clone() needs a pre-allocated stack because — unlike
+         * fork() — it doesn't copy-on-write the parent stack.
+         * The stack grows downward on x86-64, so we pass the
+         * top of the allocated region as the stack pointer.
+         */
+        char *stack = malloc(STACK_SIZE);
+        if (!stack) {
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message), "out of memory");
+            send(client_fd, &resp, sizeof(resp), 0);
+            return;
+        }
+
+        child_config_t *cfg = malloc(sizeof(child_config_t));
+        if (!cfg) {
+            free(stack);
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message), "out of memory");
+            send(client_fd, &resp, sizeof(resp), 0);
+            return;
+        }
+
+        memset(cfg, 0, sizeof(*cfg));
+        strncpy(cfg->id,      req.container_id, CONTAINER_ID_LEN - 1);
+        strncpy(cfg->rootfs,  req.rootfs[0] ? req.rootfs : rootfs,
+                PATH_MAX - 1);
+        strncpy(cfg->command, req.command, CHILD_COMMAND_LEN - 1);
+        cfg->nice_value  = req.nice_value;
+        cfg->log_write_fd = -1;   /* Task 3 will set this */
+
+        int clone_flags = SIGCHLD
+                        | CLONE_NEWPID   /* new PID namespace  */
+                        | CLONE_NEWUTS   /* new hostname       */
+                        | CLONE_NEWNS;   /* new mount table    */
+
+        pid_t pid = clone(child_fn,
+                          stack + STACK_SIZE,   /* top of stack */
+                          clone_flags,
+                          cfg);
+
+        if (pid < 0) {
+            perror("clone");
+            free(stack); free(cfg);
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message), "clone failed");
+            send(client_fd, &resp, sizeof(resp), 0);
+            return;
+        }
+
+        /* Register with kernel monitor if available (Task 4) */
+        if (ctx->monitor_fd >= 0)
+            register_with_monitor(ctx->monitor_fd,
+                                  req.container_id, pid,
+                                  req.soft_limit_bytes,
+                                  req.hard_limit_bytes);
+
+        /* Add metadata record */
+        container_record_t *rec = calloc(1, sizeof(container_record_t));
+        strncpy(rec->id, req.container_id, CONTAINER_ID_LEN - 1);
+        rec->host_pid          = pid;
+        rec->started_at        = time(NULL);
+        rec->state             = CONTAINER_RUNNING;
+        rec->soft_limit_bytes  = req.soft_limit_bytes;
+        rec->hard_limit_bytes  = req.hard_limit_bytes;
+        snprintf(rec->log_path, PATH_MAX, "%s/%s.log", LOG_DIR, req.container_id);
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+        rec->next      = ctx->containers;
+        ctx->containers = rec;
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        resp.status = 0;
+        snprintf(resp.message, sizeof(resp.message),
+                 "started '%s' pid=%d", req.container_id, pid);
+
+        /* CMD_RUN: wait for the container to finish */
+        if (req.kind == CMD_RUN) {
+            int wstatus;
+            waitpid(pid, &wstatus, 0);
+            pthread_mutex_lock(&ctx->metadata_lock);
+            rec->state = WIFSIGNALED(wstatus)
+                       ? CONTAINER_KILLED : CONTAINER_EXITED;
+            rec->exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+            pthread_mutex_unlock(&ctx->metadata_lock);
+            snprintf(resp.message, sizeof(resp.message),
+                     "'%s' exited", req.container_id);
+        }
+
+    } else if (req.kind == CMD_PS) {
+        int pos = 0;
+        pos += snprintf(resp.message + pos, sizeof(resp.message) - pos,
+                        "%-16s %-8s %-10s\n",
+                        "ID", "PID", "STATE");
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *c = ctx->containers;
+        while (c && pos < (int)sizeof(resp.message) - 40) {
+            pos += snprintf(resp.message + pos, sizeof(resp.message) - pos,
+                            "%-16s %-8d %-10s\n",
+                            c->id, c->host_pid,
+                            state_to_string(c->state));
+            c = c->next;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        resp.status = 0;
+
+    }  else if (req.kind == CMD_STOP) {
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *c = ctx->containers;
+    while (c && strcmp(c->id, req.container_id) != 0)
+        c = c->next;
+    pid_t pid = c ? c->host_pid : -1;
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    if (pid < 0) {
+        resp.status = -1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "no container '%s'", req.container_id);
+    } else {
+        /*
+         * Graceful stop: send SIGTERM first and give the
+         * container 2 seconds to exit cleanly.
+         *
+         * OS concept: SIGTERM is a polite request — the process
+         * can catch it and clean up before exiting. SIGKILL
+         * cannot be caught, blocked, or ignored — the kernel
+         * forcibly removes the process immediately.
+         */
+        kill(pid, SIGTERM);
+
+        int waited = 0;
+        int forced = 0;
+        while (waited < 20) {
+            usleep(100000);   /* wait 100ms at a time */
+            waited++;
+            /*
+             * kill(pid, 0) doesn't send a signal — it just
+             * checks if the process still exists. Returns -1
+             * with errno=ESRCH if the process is gone.
+             */
+            if (kill(pid, 0) < 0 && errno == ESRCH)
+                break;   /* process exited cleanly */
+        }
+
+        if (kill(pid, 0) == 0) {
+            /* Still alive after 2 seconds — force kill */
+            kill(pid, SIGKILL);
+            forced = 1;
+        }
+
+        /* Update state under lock */
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *c2 = ctx->containers;
+        while (c2 && strcmp(c2->id, req.container_id) != 0)
+            c2 = c2->next;
+        if (c2)
+            c2->state = forced ? CONTAINER_KILLED : CONTAINER_STOPPED;
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        resp.status = 0;
+        if (forced)
+            snprintf(resp.message, sizeof(resp.message),
+                     "'%s' did not stop gracefully, killed", req.container_id);
+        else
+            snprintf(resp.message, sizeof(resp.message),
+                     "'%s' stopped", req.container_id);
+    }
+    }
+     else if (req.kind == CMD_LOGS) {
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *c = ctx->containers;
+        while (c && strcmp(c->id, req.container_id) != 0)
+            c = c->next;
+        char log_path[PATH_MAX] = {0};
+        if (c) strncpy(log_path, c->log_path, PATH_MAX - 1);
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if (!log_path[0]) {
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "no container '%s'", req.container_id);
+        } else {
+            resp.status = 0;
+            snprintf(resp.message, sizeof(resp.message),
+                     "log: %s (Task 3 will stream contents)", log_path);
+        }
+
+    } else {
+        resp.status = -1;
+        snprintf(resp.message, sizeof(resp.message), "unknown command");
+    }
+
+    send(client_fd, &resp, sizeof(resp), 0);
+}
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -412,19 +739,134 @@ static int run_supervisor(const char *rootfs)
     }
 
     /*
-     * TODO:
-     *   1) open /dev/container_monitor
-     *   2) create the control socket / FIFO / shared-memory channel
-     *   3) install SIGCHLD / SIGINT / SIGTERM handling
-     *   4) spawn the logger thread
-     *   5) enter the supervisor event loop
+     * Step 1: Signal handlers
+     *
+     * SIGCHLD — delivered when any child changes state.
+     * We reap in a loop with WNOHANG so we never block, and
+     * update the container's state in the metadata list.
+     *
+     * SA_RESTART makes interrupted syscalls (like accept) retry
+     * automatically instead of returning EINTR.
+     * SA_NOCLDSTOP means we only get SIGCHLD on exit/kill,
+     * not on stop/continue — we don't care about those.
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    sa.sa_handler = sigterm_handler;
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    /*
+     * Step 2: UNIX domain socket
+     *
+     * This is the control channel between the CLI client and
+     * the supervisor. The client connects, sends a
+     * control_request_t, and reads back a control_response_t.
+     */
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx.server_fd < 0) {
+        perror("socket");
+        goto cleanup;
+    }
+
+    unlink(CONTROL_PATH);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        goto cleanup;
+    }
+    if (listen(ctx.server_fd, 8) < 0) {
+        perror("listen");
+        goto cleanup;
+    }
+    chmod(CONTROL_PATH, 0600);
+
+    fprintf(stdout, "[supervisor] started, listening on %s\n", CONTROL_PATH);
+    fflush(stdout);
+
+    /*
+     * Step 3: open the kernel monitor device (Task 4)
+     *
+     * If the module isn't loaded yet we continue without it —
+     * the supervisor still works, just without memory enforcement.
+     */
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0)
+        fprintf(stderr, "[supervisor] warning: kernel monitor not available (%s)\n",
+                strerror(errno));
+
+    /*
+     * Step 4: logger thread (Task 3 placeholder)
+     *
+     * We'll implement this properly in Task 3.
+     */
+    mkdir(LOG_DIR, 0755);
+
+    /*
+     * Step 5: event loop
+     *
+     * select() with a 1-second timeout lets us check
+     * g_should_stop between connections.
+     */
+    while (!g_should_stop) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(ctx.server_fd, &rfds);
+        struct timeval tv = {1, 0};
+
+        int r = select(ctx.server_fd + 1, &rfds, NULL, NULL, &tv);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) continue;
+
+        int client_fd = accept(ctx.server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            continue;
+        }
+
+        handle_request(&ctx, client_fd, rootfs);
+        close(client_fd);
+    }
+
+    /* Orderly shutdown: SIGTERM all running containers */
+    fprintf(stdout, "\n[supervisor] shutting down...\n");
+    fflush(stdout);
+    pthread_mutex_lock(&ctx.metadata_lock);
+    container_record_t *c = ctx.containers;
+    while (c) {
+        if (c->state == CONTAINER_RUNNING)
+            kill(c->host_pid, SIGTERM);
+        c = c->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    sleep(2);
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
+cleanup:
+    if (ctx.server_fd >= 0) close(ctx.server_fd);
+    if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
+    unlink(CONTROL_PATH);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+
+    fprintf(stdout, "[supervisor] done\n");
+    fflush(stdout);
+    return 0;
 }
 
 /*
@@ -437,9 +879,43 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "error: cannot connect to supervisor at %s\n"
+                "       Is it running? (sudo ./engine supervisor ./rootfs)\n",
+                CONTROL_PATH);
+        close(fd);
+        return 1;
+    }
+
+    /* Send the request */
+    if (send(fd, req, sizeof(*req), 0) != (ssize_t)sizeof(*req)) {
+        perror("send");
+        close(fd);
+        return 1;
+    }
+
+    /* Read and print the response */
+    control_response_t resp;
+    if (recv(fd, &resp, sizeof(resp), 0) != (ssize_t)sizeof(resp)) {
+        perror("recv");
+        close(fd);
+        return 1;
+    }
+
+    printf("%s\n", resp.message);
+    close(fd);
+    return resp.status == 0 ? 0 : 1;
 }
 
 static int cmd_start(int argc, char *argv[])
