@@ -289,9 +289,40 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    /*
+     * Wait while the buffer is full.
+     * pthread_cond_wait() atomically releases the mutex and
+     * puts this thread to sleep. When the consumer pops a slot
+     * and signals not_full, this thread wakes up, re-acquires
+     * the mutex, and re-checks the condition (while loop, not if
+     * — because another producer may have filled the slot again
+     * before we woke up — this is called a spurious wakeup).
+     */
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    /*
+     * Copy the item into the next free slot at tail, then
+     * advance tail circularly using modulo arithmetic.
+     */
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    /*
+     * Wake the consumer — there is now at least one item
+     * in the buffer for it to process.
+     */
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -305,11 +336,68 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    /*
+     * Wait while the buffer is empty.
+     * Same spurious wakeup pattern as push — we use while,
+     * not if. We also check shutting_down here so the logger
+     * thread can drain remaining items before exiting:
+     * only return -1 when BOTH empty AND shutting down.
+     */
+    while (buffer->count == 0 && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;   /* signal to logger thread: time to exit */
+    }
+
+    /*
+     * Copy the item from head, then advance head circularly.
+     */
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    /*
+     * Wake any blocked producer — there is now a free slot.
+     */
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
+typedef struct {
+    supervisor_ctx_t *ctx;
+    int               pipe_rd;
+    char              container_id[CONTAINER_ID_LEN];
+} producer_args_t;
+
+void *producer_thread(void *arg)
+{
+    producer_args_t *pa = (producer_args_t *)arg;
+    log_item_t item;
+
+    while (1) {
+        memset(&item, 0, sizeof(item));
+        strncpy(item.container_id, pa->container_id,
+                CONTAINER_ID_LEN - 1);
+
+        ssize_t n = read(pa->pipe_rd, item.data, LOG_CHUNK_SIZE);
+        if (n <= 0)
+            break;
+
+        item.length = (size_t)n;
+
+        if (bounded_buffer_push(&pa->ctx->log_buffer, &item) < 0)
+            break;
+    }
+
+    close(pa->pipe_rd);
+    free(pa);
+    return NULL;
+}
 /*
  * TODO:
  * Implement the logging consumer thread.
@@ -321,10 +409,55 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+
+    while (1) {
+        /*
+         * Block until a log chunk is available or shutdown.
+         * Returns -1 when buffer is empty AND shutting down —
+         * that is our signal to exit.
+         */
+        if (bounded_buffer_pop(&ctx->log_buffer, &item) < 0)
+            break;
+
+        /*
+         * Open the log file for this container in append mode.
+         * O_CREAT creates it if it doesn't exist yet.
+         * Each container has its own log file at logs/<id>.log
+         */
+        char log_path[PATH_MAX];
+        snprintf(log_path, sizeof(log_path), "%s/%s.log",
+                 LOG_DIR, item.container_id);
+
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            perror("open log file");
+            continue;
+        }
+
+        /*
+         * Write the chunk. write() may write less than requested
+         * if interrupted — the while loop retries until all
+         * bytes are written or an error occurs.
+         */
+        size_t written = 0;
+        while (written < item.length) {
+            ssize_t n = write(fd, item.data + written,
+                              item.length - written);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("write log");
+                break;
+            }
+            written += (size_t)n;
+        }
+
+        close(fd);
+    }
+
     return NULL;
 }
-
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -549,7 +682,25 @@ static void handle_request(supervisor_ctx_t *ctx,
                 PATH_MAX - 1);
         strncpy(cfg->command, req.command, CHILD_COMMAND_LEN - 1);
         cfg->nice_value  = req.nice_value;
-        cfg->log_write_fd = -1;   /* Task 3 will set this */
+        /*
+         * Create a pipe for this container's output.
+         * pipe_fds[0] = read-end  (supervisor reads logs)
+         * pipe_fds[1] = write-end (container writes stdout/stderr)
+         *
+         * After clone(), the child inherits the write-end and
+         * dup2's it onto stdout/stderr. The supervisor keeps
+         * the read-end and a producer thread drains it.
+         */
+        int pipe_fds[2];
+        if (pipe(pipe_fds) < 0) {
+            perror("pipe");
+            free(stack); free(cfg);
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message), "pipe failed");
+            send(client_fd, &resp, sizeof(resp), 0);
+            return;
+        }
+        cfg->log_write_fd = pipe_fds[1];
 
         int clone_flags = SIGCHLD
                         | CLONE_NEWPID   /* new PID namespace  */
@@ -569,7 +720,20 @@ static void handle_request(supervisor_ctx_t *ctx,
             send(client_fd, &resp, sizeof(resp), 0);
             return;
         }
+/* Close write-end in supervisor — only container needs it */
+        close(pipe_fds[1]);
 
+        /* Spawn producer thread to drain this container's pipe */
+        producer_args_t *pa = malloc(sizeof(producer_args_t));
+        if (pa) {
+            pa->ctx     = ctx;
+            pa->pipe_rd = pipe_fds[0];
+            strncpy(pa->container_id, req.container_id,
+                    CONTAINER_ID_LEN - 1);
+            pthread_t prod_thread;
+            pthread_create(&prod_thread, NULL, producer_thread, pa);
+            pthread_detach(prod_thread);  /* auto-cleanup on exit */
+        }
         /* Register with kernel monitor if available (Task 4) */
         if (ctx->monitor_fd >= 0)
             register_with_monitor(ctx->monitor_fd,
@@ -807,11 +971,19 @@ static int run_supervisor(const char *rootfs)
                 strerror(errno));
 
     /*
-     * Step 4: logger thread (Task 3 placeholder)
+     * Step 4: logger thread
      *
-     * We'll implement this properly in Task 3.
+     * One shared consumer thread that pops chunks from the
+     * bounded buffer and writes them to per-container log files.
      */
     mkdir(LOG_DIR, 0755);
+
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_create logger");
+        goto cleanup;
+    }
 
     /*
      * Step 5: event loop
@@ -860,12 +1032,15 @@ cleanup:
     if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
     unlink(CONTROL_PATH);
 
+    /* Signal logger thread to drain and exit */
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
+
+    /* Wait for logger thread to finish writing */
+    if (ctx.logger_thread)
+        pthread_join(ctx.logger_thread, NULL);
+
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-
-    fprintf(stdout, "[supervisor] done\n");
-    fflush(stdout);
     return 0;
 }
 
