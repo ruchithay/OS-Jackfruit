@@ -126,29 +126,36 @@ cd boilerplate && make clean
 ## 3. Demo with Screenshots
 
 ### Screenshot 1 — Multi-container supervision
-Two containers (alpha, beta) running concurrently under one supervisor process, visible via `ps aux | grep engine`.
+![Multi-container supervision](screenshots/SS1_multicontainer.png)
+*Two containers alpha and beta running concurrently under one supervisor process shown via ps aux.*
 
 ### Screenshot 2 — Metadata tracking
-Output of `./engine ps` showing container ID, host PID, and state for all tracked containers.
+![Metadata tracking](screenshots/SS2_ps.png)
+*Output of ./engine ps showing container ID, host PID, and state for all tracked containers.*
 
 ### Screenshot 3 — Bounded-buffer logging
-Log file contents captured through the logging pipeline. `cat logs/alpha.log` shows container output written via the producer-consumer pipeline.
+![Bounded-buffer logging](screenshots/SS3_logging.png)
+*Log file contents captured through the producer-consumer pipeline, written to logs/alpha.log via the logger thread.*
 
 ### Screenshot 4 — CLI and IPC
-A `start` command issued from Terminal 2 reaching the supervisor in Terminal 1 via the UNIX domain socket at `/tmp/mini_runtime.sock`. The supervisor prints the container launch confirmation.
+![CLI and IPC](screenshots/SS4_cli_ipc.png)
+*A start command issued from the CLI client reaching the supervisor via the UNIX domain socket at /tmp/mini_runtime.sock.*
 
 ### Screenshot 5 — Soft-limit warning
-`dmesg` output showing `[container_monitor] SOFT LIMIT container=memtest pid=... rss=... limit=...` after the memory_hog container exceeds its 10 MiB soft limit.
+![Soft-limit warning](screenshots/SS5_soft_limit.png)
+*dmesg output showing the kernel module emitting a SOFT LIMIT warning when the container exceeds its 10 MiB soft limit.*
 
 ### Screenshot 6 — Hard-limit enforcement
-`dmesg` showing `[container_monitor] HARD LIMIT` followed by `./engine ps` showing the container in `killed` state — confirming the supervisor's SIGCHLD handler updated metadata correctly.
+![Hard-limit enforcement](screenshots/SS6_hard_limit.png)
+*dmesg showing HARD LIMIT kill event and ./engine ps confirming the container state updated to killed.*
 
 ### Screenshot 7 — Scheduling experiment
-Side-by-side log output of hog1 (nice 0) and hog2 (nice 19) showing hog2 progressing slower in wall-clock time under CFS scheduling.
+![Scheduling experiment](screenshots/SS7_scheduling.png)
+*Log output comparison of hog1 (nice 0) completing 20 seconds while hog2 (nice 19) only reached elapsed=16 in the same wall-clock time.*
 
 ### Screenshot 8 — Clean teardown
-`ps aux` output after supervisor shutdown showing no residual engine, cpu_hog, or sh processes — confirming clean reaping and no zombies.
-
+![Clean teardown](screenshots/SS8_teardown.png)
+*ps aux output after supervisor shutdown showing no residual engine, cpu_hog, or sh processes — confirming clean reaping and no zombies.*
 ---
 
 ## 4. Engineering Analysis
